@@ -1,166 +1,190 @@
-<#
-.SYNOPSIS
-    Close a ServiceNow incident using correlation ID with enhanced search patterns and proper SNOW module integration.
-.DESCRIPTION
-    Closes a ServiceNow incident by correlation ID using the production SNOW module with multiple search patterns for reliable incident matching.
-.PARAMETER CorrelationId
-    The correlation ID (Event ID) to find and close the associated ServiceNow incident.
-.PARAMETER ServiceNowEnvironment
-    The ServiceNow environment (gmo, gmodev, gmotest).
-.PARAMETER CloseNotes
-    Notes to add to the closed incident.
-.EXAMPLE
-    .\SNWCloseIncidentModule.ps1 -CorrelationId "30097" -ServiceNowEnvironment gmodev
-#>
-
-param(
-    [Parameter(Mandatory = $true)][string]$CorrelationId,
-    [Parameter(Mandatory = $true)][ValidateSet('gmodev', 'gmotest', 'gmo')][string]$ServiceNowEnvironment,
-    [string]$CloseNotes = 'Closed by automation as event is obsolete.'
+param([Parameter(Mandatory = $true)][ValidateSet('1', '2', '3')]$urgency,
+    [Parameter(Mandatory = $true)][ValidateSet('1', '2', '3')]$impact,
+    [Parameter(Mandatory = $true)][string]$assignmentgroup,
+    [Parameter(Mandatory = $true)][ValidateSet('Information Security', 'software', 'Facilities', 'IT Facilities', 'Infrastructure Services', 'Network/Voice', 'hardware', 'Logical Access', 'Production Control')]$category,
+    [Parameter(Mandatory = $true)][string]$alertsource,
+    [Parameter(Mandatory = $true)][string]$affectedSCI,
+    [Parameter(Mandatory = $true)][string]$affectedHCI,
+    [Parameter(Mandatory = $true)][string]$subcategory,
+    [Parameter(Mandatory = $true)][string]$worknotes,
+    [Parameter(Mandatory = $true)][string]$shortdescription,
+    [Parameter(Mandatory = $true)][ValidateSet('gmodev', 'gmotest', 'gmo')]$ServiceNowEnvironment,
+    [Parameter(Mandatory = $true)][string]$correlationid
 )
 
-# Simple logging function
-function Write-CloseLog {
+#'------------------------------------------------------------------------------
+#'Logging Functions
+#'------------------------------------------------------------------------------
+function Get-IsoDateTime {
+    return (Get-Date -UFormat '%Y-%m-%d %H:%M:%S')
+}
+
+function Write-LogMessage {
     param(
-        [int]$logType,
-        [string]$message
+        [string]$Message,
+        [string]$Level = 'INFO'
     )
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logMessage = "$timestamp,$message"
 
-    # Create separate log files for each event
-    $logDate = Get-Date -Format 'yyyy-MM-dd'
-    $logFileName = "$logDate-SNWCloseIncident-Event$CorrelationId"
-    $logPath = 'D:\Program Files\NetApp\ocum\scriptPlugin\Logs'
+    try {
+        $timestamp = Get-IsoDateTime
+        $logEntry = "$timestamp [$Level] SNWNewIncident: $Message"
 
-    if ($logType -eq 0) {
-        # Normal log
-        Add-Content -Path "$logPath\$logFileName.log" -Value $logMessage
-    } elseif ($logType -eq 1) {
-        # Warning log
-        Add-Content -Path "$logPath\$logFileName.log" -Value $logMessage
-    } else {
-        # Error log
-        Add-Content -Path "$logPath\$logFileName.err" -Value $logMessage
+        # Create logs directory if it doesn't exist
+        $scriptPath = Split-Path($MyInvocation.ScriptName)
+        $logsPath = Join-Path $scriptPath 'Logs'
+        if (!(Test-Path $logsPath)) {
+            New-Item -ItemType Directory -Force -Path $logsPath | Out-Null
+        }
+
+        # Log to file
+        $logFile = Join-Path $logsPath "$(Get-Date -UFormat '%Y-%m-%d')-SNWNewIncident.log"
+        $logEntry | Out-File -FilePath $logFile -Append -Encoding ASCII
+
+        # Also write to console for immediate feedback
+        Write-Host $logEntry -ForegroundColor $(
+            switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN' { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'White' }
+            }
+        )
+    } catch {
+        # Fallback if logging fails
+        Write-Host "LOGGING ERROR: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# Log script start
-Write-CloseLog -logType 0 -message "Closing incident for CorrelationId: $CorrelationId"
+Write-LogMessage '===== SNWNewIncidentModule.ps1 Started ====='
+Write-LogMessage "CorrelationId: $correlationid | AffectedHCI: $affectedHCI | Environment: $ServiceNowEnvironment"
 
-# Check SNOW module access before importing
-$snowModulePath = '\\gmo\dsl\SysConfig\ServiceNow\SNOW.psm1'
-
-try {
-    Import-Module $snowModulePath -Force -ErrorAction Stop
-} catch {
-    Write-CloseLog -logType 2 -message "Failed to import SNOW module: $($_.Exception.Message)"
-    exit 1
-}
-
-
-function Close-ServiceNowIncident {
+#'------------------------------------------------------------------------------
+#'CMDB Lookup Function to retrieve sys_id for affected systems
+#'------------------------------------------------------------------------------
+function Get-SystemSysID {
     param(
-        [Parameter(Mandatory = $true)][string]$sys_id,
-        [Parameter(Mandatory = $true)][string]$ServiceNowEnvironment,
-        [string]$CloseNotes = 'Closed by automation as event is obsolete.'
+        [string]$SystemName,
+        [string]$ServiceNowEnvironment = 'gmodev'
     )
 
-    $automationUser = 'a0b74c684fc383009a2d01b28110c750'  # Example sys_id for Automation User
-    $assignmentGroup = 'e45d2fdb1b53e8d0ddd00d45624bcb92' # Example sys_id for SNWOpsEng
-
-    $body = @{
-        work_notes           = 'Resolving ticket via automation.'
-        assigned_to          = $automationUser
-        assignment_group     = $assignmentGroup
-        resolved_by          = $automationUser
-        state                = '6'  # 6 = Resolved
-        incident_state       = '6'  # Explicit incident state field
-        close_code           = 'Completed - Success'
-        close_notes          = $CloseNotes
-        u_resolution_applied = 'Automation confirmed event closure.'
-        u_root_cause         = 'Automated event lifecycle closure.'
-    } | ConvertTo-Json
-
-    $closeUri = "https://$ServiceNowEnvironment.service-now.com/api/now/table/incident/$sys_id"
-
     try {
-        $response = New-SNWRequest -Method Patch -Uri $closeUri -ServiceNowEnvironment $ServiceNowEnvironment -body $body
+        # Import the SNOW module to access CMDB functions
+        Import-Module '\\gmo\dsl\SysConfig\ServiceNow\SNOW.psm1' -Force
 
-        # Alternative verification: Check if any active incidents still exist for this correlation ID
-        Start-Sleep -Seconds 2
+        # Try exact match first
         try {
-            $verifyQuery = "?sysparm_query=short_descriptionLIKE$CorrelationId^active=true^stateNOT IN6"
-            $verifyUri = "https://$ServiceNowEnvironment.service-now.com/api/now/table/incident$verifyQuery&sysparm_fields=sys_id,number,state&sysparm_limit=1"
-            $verifyResult = New-SNWRequest -Method Get -Uri $verifyUri -ServiceNowEnvironment $ServiceNowEnvironment
+            $sysId = Get-SNWSysID -ci_name $SystemName -ci_type 'any' -ServiceNowEnvironment $ServiceNowEnvironment
 
-            if (-not $verifyResult.result -or $verifyResult.result.Count -eq 0) {
-                Write-CloseLog -logType 0 -message 'Successfully closed incident - No active incidents found for correlation ID'
-            } else {
-                Write-CloseLog -logType 1 -message "Warning: Found $($verifyResult.result.Count) active incident(s) still exist for correlation ID"
+            if (-not [string]::IsNullOrEmpty($sysId)) {
+                Write-LogMessage "CMDB: Found sys_id '$sysId' for '$SystemName'" 'SUCCESS'
+                return $sysId
             }
         } catch {
-            Write-CloseLog -logType 1 -message 'Verification query failed, but close API call was successful'
+            Write-LogMessage "CMDB lookup error for '$SystemName': $($_.Exception.Message)" 'ERROR'
         }
 
-        Write-CloseLog -logType 0 -message 'Successfully closed incident - API call completed'
-        return $true
+        # Try fallback with short name if FQDN
+        if ($SystemName -match '\.') {
+            $shortName = $SystemName.Split('.')[0]
+            try {
+                $sysId = Get-SNWSysID -ci_name $shortName -ci_type 'any' -ServiceNowEnvironment $ServiceNowEnvironment
+
+                if (-not [string]::IsNullOrEmpty($sysId)) {
+                    Write-LogMessage "CMDB: Found sys_id '$sysId' for short name '$shortName'" 'SUCCESS'
+                    return $sysId
+                }
+            } catch {
+                Write-LogMessage "CMDB fallback lookup error for '$shortName': $($_.Exception.Message)" 'ERROR'
+            }
+        }
+
+        # No sys_id found
+        Write-LogMessage "CMDB: No sys_id found for '$SystemName', using hostname" 'WARN'
+        return $null
+
     } catch {
-        Write-CloseLog -logType 2 -message "Error closing incident sys_id ${sys_id}: $($_.Exception.Message)"
-        return $false
+        Write-LogMessage "CMDB: Critical error for '$SystemName': $($_.Exception.Message)" 'ERROR'
+        return $null
     }
 }
 
-# Enhanced search query with multiple patterns - includes New (1) and Pending Automation (20) states
-$queries = @(
-    "?sysparm_query=short_descriptionLIKE$CorrelationId^active=true^stateIN1,20",
-    "?sysparm_query=short_descriptionCONTAINS$CorrelationId^active=true^stateIN1,20",
-    "?sysparm_query=short_descriptionENDSWITH$CorrelationId^active=true^stateIN1,20",
-    "?sysparm_query=correlation_id=$CorrelationId^active=true^stateIN1,20"
-)
+# Perform CMDB lookup to get sys_id for the affected system
+$systemSysId = Get-SystemSysID -SystemName $affectedHCI -ServiceNowEnvironment $ServiceNowEnvironment
 
-$fields = '&sysparm_fields=sys_id,number,short_description,correlation_id,state&sysparm_limit=5'
-$incident = $null
-
-foreach ($query in $queries) {
-    $uri = "https://$ServiceNowEnvironment.service-now.com/api/now/table/incident$query$fields"
-
-    try {
-        $request = New-SNWRequest -Method 'get' -Uri $uri -ServiceNowEnvironment $ServiceNowEnvironment
-        $result = $request.result
-
-        if ($result -and $result.Count -gt 0) {
-            $incident = $result[0]
-            Write-CloseLog -logType 0 -message "Found incident: $($incident.number) | State: $($incident.state)"
-            break
-        }
-    } catch {
-        Write-CloseLog -logType 2 -message "Search error for query '$query': $($_.Exception.Message)"
-        continue
-    }
-}
-
-if (-not $incident) {
-    Write-CloseLog -logType 1 -message "No incident found for correlation_id: $CorrelationId"
-    exit 1
-}
-
-$incidentSysId = $incident.sys_id
-$incidentNum = $incident.number
-$incidentState = $incident.state
-
-if ($incidentState -eq '6' -or $incidentState -eq 'Closed' -or $incidentState -eq 'Resolved') {
-    Write-CloseLog -logType 0 -message "Incident $incidentNum already closed"
-    exit 0
-}
-
-$success = Close-ServiceNowIncident -sys_id $incidentSysId -ServiceNowEnvironment $ServiceNowEnvironment -CloseNotes $CloseNotes
-
-if ($success) {
-    Write-CloseLog -logType 0 -message "SUCCESS: Closed incident $incidentNum"
-    Write-Output "SUCCESS: Closed incident $incidentNum for event $CorrelationId"
-    exit 0
+# Use sys_id if found, otherwise fall back to hostname
+$finalAffectedHCI = if (-not [string]::IsNullOrEmpty($systemSysId)) {
+    $systemSysId
 } else {
-    Write-CloseLog -logType 2 -message "Failed to close incident $incidentNum"
-    exit 1
+    $affectedHCI
+}
+
+# set user and path to password files
+$user = switch ($ServiceNowEnvironment) {
+    'gmodev' { 'InboundDevUser' }
+    'gmotest' { 'InboundTestUser' }
+    'gmo' { 'InboundPrdUser' }
+}
+$fileloc = switch ($ServiceNowEnvironment) {
+    'gmodev' { 'ServiceNowdev\InbounddevUser' }
+    'gmotest' { 'ServiceNowtest\InboundtestUser' }
+    'gmo' { 'ServiceNow\InboundPrdUser' }
+}
+
+try {
+    $key = Get-Content -Path "D:\Program Files\NetApp\ocum\scriptPlugin\$fileloc.Key"
+    $PasswordFile = "D:\Program Files\NetApp\ocum\scriptPlugin\$fileloc.txt"
+    $MyCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $user, (Get-Content $PasswordFile | ConvertTo-SecureString -Key $key)
+    $pass = $MyCredential.GetNetworkCredential().Password
+} catch {
+    Write-LogMessage "ERROR loading ServiceNow credentials: $($_.Exception.Message)" 'ERROR'
+    throw $_
+}
+
+# Build auth header
+$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(('{0}:{1}' -f $user, $pass)))
+# Set proper headers
+$headers = New-Object 'System.Collections.Generic.Dictionary[[String],[String]]'
+$headers.Add('Authorization', ('Basic {0}' -f $base64AuthInfo))
+$headers.Add('Accept', 'application/json')
+$headers.Add('Content-Type', 'application/json')
+# Specify endpoint uri
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+$uri = "https://$ServiceNowEnvironment.service-now.com/api/now/table/u_inbound_staging"
+
+# Specify HTTP method
+$method = 'post'
+# Specify request body
+$body = "{
+""u_action"":""Create Incident"",
+""u_alert_source"":""$alertsource"",
+""u_affected_hardware_ci"":""$finalAffectedHCI"",
+""u_affected_software_ci"":""$affectedSCI"",
+""u_assignment_group"":""$assignmentgroup"",
+""u_category"":""$category"",
+""u_correlation_id"":""$correlationid"",
+""u_impact"":""$impact"",
+""u_inbound_type"":""REST"",
+""u_message"":""$worknotes"",
+""u_subcategory"":""$subcategory"",
+""u_subject"":""$shortdescription"",
+""u_urgency"":""$urgency""
+}"
+
+# Send HTTP request
+try {
+    $response = Invoke-WebRequest -Headers $headers -Method $method -Uri $uri -Body $body -UseBasicParsing
+    $getresponse = ConvertFrom-Json -InputObject $response
+    $incidentId = $getresponse.result.u_result_incident_id
+
+    if (-not [string]::IsNullOrEmpty($incidentId)) {
+        Write-LogMessage "SUCCESS: Incident $incidentId created with affected_ci: $finalAffectedHCI" 'SUCCESS'
+    } else {
+        Write-LogMessage 'WARNING: No incident ID returned' 'WARN'
+    }
+
+    Write-LogMessage '===== SNWNewIncidentModule.ps1 Completed ====='
+    return $incidentId
+} catch {
+    Write-LogMessage "ERROR during incident creation: $($_.Exception.Message)" 'ERROR'
+    throw $_
 }
