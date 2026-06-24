@@ -1,0 +1,129 @@
+# Storage Volume Reporting Pipeline
+# Author: Sritam Mohanty
+# Description: Runs daily volume capacity + backup status collection on the
+#              Windows SharedBuild agent and uploads CSVs to SharePoint.
+# Schedule: Daily at 06:00 UTC (before business hours / Power BI refresh at 07:00)
+# Pool: SharedBuild (Windows agent)
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - Storage-Reporting/*
+
+schedules:
+  - cron: "0 6 * * *"         # 06:00 UTC every day
+    displayName: "Daily 06:00 UTC collection"
+    branches:
+      include:
+        - master
+    always: true               # run even if no new commits
+
+pool:
+  name: 'SharedBuild'
+
+variables:
+  - name: buildSharePath
+    value: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+
+  # ── Required pipeline secret variables ─────────────────────────────────────
+  #   NETAPP_SSH_USER          — ONTAP SSH username (svc_netapp)
+  #   NETAPP_SSH_PASSWORD      — ONTAP SSH password (used from Windows agent)
+  #   AZURE_TENANT_ID          — Azure AD tenant ID
+  #   AZURE_CLIENT_ID          — Service principal client ID (ANF Reader + SP writer)
+  #   AZURE_CLIENT_SECRET      — Service principal client secret
+  #   ANF_SUBSCRIPTION_ID      — Azure subscription containing ANF accounts
+  #   CV_REPORT_DIR            — UNC path to directory with Commvault CSV reports
+  #   SP_CLIENT_ID             — App registration client ID (Graph Sites.ReadWrite.All)
+  #   SP_CLIENT_SECRET         — App registration client secret
+  #   SHAREPOINT_HOSTNAME      — onlinegmo.sharepoint.com
+  #   SHAREPOINT_SITE_PATH     — /sites/teams_platformengineering
+
+steps:
+  # ── Step 1: Announce build ─────────────────────────────────────────────────
+  - script: echo Storage Volume Reporting Build $(Build.BuildNumber) started
+    displayName: 'Start'
+
+  # ── Step 2: Copy scripts to build share (artifact history) ────────────────
+  - task: CopyFiles@2
+    inputs:
+      Contents: |
+        Storage-Reporting/**
+      TargetFolder: '$(buildSharePath)'
+    condition: succeeded()
+    displayName: 'Copy Storage-Reporting scripts to build share'
+
+  # ── Step 3: Publish build artifact ────────────────────────────────────────
+  - task: PublishBuildArtifacts@1
+    inputs:
+      PathtoPublish: '$(buildSharePath)'
+      ArtifactName:  'StorageReportingDrop'
+    condition: succeeded()
+    displayName: 'Publish artifacts'
+
+  # ── Step 4: Install Python dependencies ───────────────────────────────────
+  - powershell: |
+      Write-Host "Installing Python dependencies..."
+      py -m pip install -r Storage-Reporting\requirements.txt --quiet
+      if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
+      Write-Host "Dependencies installed."
+    displayName: 'Install Python dependencies'
+    condition: succeeded()
+
+  # ── Step 4b: Download SSH private key from Secure Files ───────────────────
+  - task: DownloadSecureFile@1
+    name: sshKey
+    inputs:
+      secureFile: 'svc_netapp_id_rsa'
+    displayName: 'Download svc_netapp SSH private key'
+    condition: succeeded()
+
+  # ── Step 4c: Install DFSN RSAT module (required for Get-DfsnRoot) ─────────
+  - powershell: |
+      $module = Get-Module -ListAvailable -Name DFSN
+      if ($module) {
+          Write-Host "DFSN module already available."
+      } else {
+          Write-Host "Installing RSAT-DFS-Mgmt-Con feature..."
+          $result = Install-WindowsFeature -Name RSAT-DFS-Mgmt-Con -ErrorAction SilentlyContinue
+          if ($result -and $result.Success) {
+              Write-Host "RSAT-DFS-Mgmt-Con installed successfully."
+          } else {
+              Write-Warning "Could not install RSAT-DFS-Mgmt-Con — DFS mapping will be skipped."
+          }
+      }
+    displayName: 'Ensure DFSN PowerShell module is available'
+    condition: succeeded()
+
+  # ── Step 5: Run the daily collection ──────────────────────────────────────
+  - powershell: |
+      cd Storage-Reporting
+      py -u volume_reporting_main.py
+      exit $LASTEXITCODE
+    displayName: 'Run volume_reporting_main.py'
+    timeoutInMinutes: 10
+    condition: succeeded()
+    env:
+      # ONTAP — SSH key downloaded from Secure Files
+      NETAPP_SSH_USER:          $(NETAPP_SSH_USER)
+      NETAPP_SSH_KEY_PATH:      $(sshKey.secureFilePath)
+      NETAPP_CLUSTERS_FILE:     $(Build.SourcesDirectory)\Monitoring\netapp_clusters.conf
+      # ANF
+      AZURE_TENANT_ID:          $(AZURE_TENANT_ID)
+      AZURE_CLIENT_ID:          $(AZURE_CLIENT_ID)
+      AZURE_CLIENT_SECRET:      $(AZURE_CLIENT_SECRET)
+      ANF_SUBSCRIPTION_ID:      $(ANF_SUBSCRIPTION_ID)
+      # Commvault — directory containing the two scheduled CSV report exports
+      # (SubClient Configuration Information_*.csv + Data Protection_*.csv)
+      CV_REPORT_DIR:            $(CV_REPORT_DIR)
+      # SharePoint
+      SP_TENANT_ID:             $(AZURE_TENANT_ID)
+      SP_CLIENT_ID:             $(SP_CLIENT_ID)
+      SP_CLIENT_SECRET:         $(SP_CLIENT_SECRET)
+      SHAREPOINT_HOSTNAME:      $(SHAREPOINT_HOSTNAME)
+      SHAREPOINT_SITE_PATH:     $(SHAREPOINT_SITE_PATH)
+      SHAREPOINT_FOLDER:        $(SHAREPOINT_FOLDER)
+      PYTHONUNBUFFERED:          "1"
+      PYTHONIOENCODING:          "utf-8"

@@ -1,0 +1,38 @@
+# Storage-Monitoring-pipeline
+# Author: Anantha Dommeti
+# Date: 02/26/2025
+# Description: This pipeline is used to build and deploy the storage monitoring application
+# Trigger: This pipeline is triggered when there is a commit to the master branch and the path is Monitoring/*
+# Pool: SharedBuild
+# Version: 1.0
+# Changes: Initial version
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - Monitoring/*
+
+pool:
+  name: 'SharedBuild'
+
+steps:
+- script: echo Hello There, Build Process Started!
+  displayName: 'Start Build'
+  
+- task: CopyFiles@2
+  inputs:
+    Contents: |
+      Monitoring/**
+    TargetFolder: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+  condition: succeeded()
+  displayName: 'Copy Monitoring files to Build Artifacts'
+  
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+    ArtifactName: 'BuildDrop'
+  condition: succeeded()
+  displayName: 'Publish Storage Monitoring Artifacts'

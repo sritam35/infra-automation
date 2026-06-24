@@ -1,0 +1,39 @@
+# Storage Automation pipeline
+# Author: Amol Deshmukh/Anantha Dommeti
+# Date: 02/26/2025
+# Description: This pipeline is used to build and deploy the storage monitoring application
+# Trigger: This pipeline is triggered when there is a commit to the master branch and the path is Monitoring/*
+# Pool: SharedBuild
+# Version: 1.1
+# Changes: Standardize paths
+# 1.0 Initial version
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - Automation/*
+
+pool:
+  name: 'SharedBuild'
+
+steps:
+- script: echo Hello There, Build Process Started!
+  displayName: 'Start Build'
+  
+- task: CopyFiles@2
+  inputs:
+    Contents: |
+      Automation/**
+    TargetFolder: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+  condition: succeeded()
+  displayName: 'Copy Artifacts'
+  
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+    ArtifactName: 'BuildDrop'
+  condition: succeeded()
+  displayName: 'Publish Artifacts'
