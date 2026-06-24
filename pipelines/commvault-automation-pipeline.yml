@@ -1,0 +1,38 @@
+# Commvault Automation pipeline
+# Author: Sritam Mohanty
+# Date: 02/11/2026
+# Description: This pipeline is used to build and deploy the Commvault automation scripts
+# Trigger: This pipeline is triggered when there is a commit to the master branch and the path is Commvault/*
+# Pool: SharedBuild
+# Version: 1.0
+# Changes: Initial version
+
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - Commvault/**
+
+pool:
+  name: 'SharedBuild'
+
+steps:
+- script: echo Hello There, Build Process Started!
+  displayName: 'Start Build'
+
+- task: CopyFiles@2
+  inputs:
+    Contents: |
+      Commvault/**
+    TargetFolder: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+  condition: succeeded()
+  displayName: 'Copy Commvault files to Build Artifacts'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '\\gmo\app\Build\DevOps\$(Build.DefinitionName)\$(Build.BuildNumber)'
+    ArtifactName: 'BuildDrop'
+  condition: succeeded()
+  displayName: 'Publish Commvault Automation Artifacts'
