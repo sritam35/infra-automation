@@ -1,0 +1,145 @@
+# ANF DR Automation Reference
+
+## Scripts & Purpose
+| Script | Purpose |
+|--------|---------|
+| `Invoke-DR-Failover.ps1` | 4-step automated Phase 1 failover (disable EU2 DFS → break ANF replication → enable CUS DFS) |
+| `Invoke-DR-Failback.ps1` | 4-step automated Phase 2 failback (disable CUS DFS → resync ANF → enable EU2 DFS) |
+| `Manage-ANFReplication.ps1` | Core break/resync/status for ANF cross-region replication |
+| `Manage-DFSPath.ps1` | DFS folder target enable/disable with auto state detection |
+| `Get-DR-Status.ps1` | Visual dashboard: DFS target states + ANF mirror states (color-coded) |
+| `Create-ANFVolumes.ps1` | Provision source (EU2) + DataProtection replica (CUS) volumes with replication config |
+| `Establish-ANFReplication.ps1` | Authorize + establish replication (EU2 → CUS); polls until Mirrored state |
+| `Get-DFSTargets.ps1` | Read-only DFS inventory with AD site association (now merged into Manage-DFSPath) |
+
+## Config Files
+| File | Purpose |
+|------|---------|
+| `ANF_DR_Config.csv` | Canonical DR config: Environment, DFSFolderPath, SourceTarget, DRTarget, VolumeName |
+| `dr_state_production.json` | Failover/failback phase state: `{"DisabledTarget": "\\\\...", "Timestamp": "ISO-8601"}` |
+| `dr_state_test.json` | Same for Test environment |
+
+## Manage-ANFReplication.ps1 Parameters
+```powershell
+-Action       # Required: GetStatus | BreakReplication | ResyncReplication
+-Environment  # Production (default) | Test — auto-sets account/RG/pool
+-VolumeNames  # Optional — auto-loaded from ANF_DR_Config.csv if omitted
+-WaitForCompletion  # Bool — poll until Mirrored/Broken state
+-MaxWaitMinutes     # Default 120, poll every 60 seconds
+-Force        # Skip "Type CONFIRM-RESYNC" prompt for ResyncReplication
+-ConfigFile   # Path to ANF_DR_Config.csv
+-Help         # Show colored workflow guide
+```
+
+## Manage-DFSPath.ps1 Parameters
+```powershell
+-Action        # Required: GetStatus | Enable | Disable
+-Environment   # Test | Production (CSV auto-load mode)
+-DFSFolderPath # Explicit mode (overrides CSV)
+-TargetPaths   # Explicit mode (overrides CSV)
+-Credential    # PSCredential; auto-loads from ~\.gmo_admin_cred.xml (DPAPI)
+-ConfigFile    # Path to ANF_DR_Config.csv
+-WhatIf        # Preview without applying
+```
+
+## Environment → Account Mapping
+| Environment | Source Account | DR Account | DR Pool |
+|-------------|---------------|------------|---------|
+| Production | eu2prdanf01 | cusprdanf01 | quant_standard |
+| Test | eu2tstanf01 | custstanf01 | test |
+
+## Az.NetAppFiles Cmdlets Used
+```powershell
+# Create volumes
+New-AzNetAppFilesVolume -VolumeType DataProtection
+
+# Replication management
+Approve-AzNetAppFilesReplication   # Authorize (source volume)
+Suspend-AzNetAppFilesReplication   # Break replication (DR volume → read/write)
+Resume-AzNetAppFilesReplication    # Resync (DR volume → replica of source)
+Get-AzNetAppFilesReplicationStatus # Poll for MirrorState, RelationshipStatus
+
+# Module conflict note: Az.NetAppFiles v1.0.0 + Az.Accounts 5.3.2+ conflict
+# Use fresh pwsh process: pwsh -NoProfile { ... }
+```
+
+## MirrorState Interpretation
+| State | Meaning |
+|-------|---------|
+| `Mirrored` + `Idle` | Normal replication healthy |
+| `Broken` + `Healthy=True` | **DR active** — expected during failover (volume is read/write) |
+| `Resyncing` | Failback in progress — DR volume reverting to replica |
+| `Uninitialized` | Replication not yet established |
+
+## Volume Auto QoS Detection Pattern
+```powershell
+$pool = Get-AzNetAppFilesPool -AccountName $account -PoolName $poolName -ResourceGroupName $rg
+$isAutoQos = $pool.QosType -eq 'Auto'
+$volumeParams = @{ ... }
+if (-not $isAutoQos) { $volumeParams['ThroughputMibps'] = $ThroughputMibps }
+New-AzNetAppFilesVolume @volumeParams
+```
+
+## Credential Auto-Load (DPAPI)
+```powershell
+# One-time setup:
+Get-Credential | Export-Clixml -Path "$env:USERPROFILE\.gmo_admin_cred.xml"
+
+# In script:
+if (Test-Path "$env:USERPROFILE\.gmo_admin_cred.xml") {
+    $Credential = Import-Clixml -Path "$env:USERPROFILE\.gmo_admin_cred.xml"
+} else {
+    $Credential = Get-Credential -UserName 'gmo\admin-smohanty'
+}
+```
+
+## WinRM Workaround (Local Process Elevation)
+```powershell
+# WinRM + DCOM blocked for non-admin account
+# Solution: write inner script to temp file, run via Start-Process
+$innerScript = @"
+Import-Module DFSN
+Get-DfsnFolderTarget -Path '$DFSFolderPath'
+"@
+$tmpScript = "$env:TEMP\_dfs_inner_$(Get-Date -f yyyyMMddHHmmss).ps1"
+$innerScript | Out-File $tmpScript -Encoding UTF8
+Start-Process pwsh -ArgumentList "-NoProfile -File `"$tmpScript`"" `
+    -Credential $Credential -Wait -PassThru
+Remove-Item $tmpScript
+```
+
+## Export Policy Pattern (3-tier)
+```json
+"exportPolicy": {
+  "rules": [
+    { "ruleIndex": 1, "allowedClients": "10.15.32.0/20", "nfsv41": true, "hasRootAccess": false },
+    { "ruleIndex": 2, "allowedClients": "10.20.33.22/23", "nfsv41": true, "hasRootAccess": true },
+    { "ruleIndex": 3, "allowedClients": "10.0.0.0/8",    "nfsv41": true, "hasRootAccess": false }
+  ]
+}
+```
+
+## ANF Volume ARM Template Conventions
+- Size in bytes: GiB × 1073741824 (e.g., 100 GiB = 107374182400 bytes)
+- `StorageBlockSize` parameter = size unit in bytes (4 TB = 4398046511104)
+- Service levels: Standard (most DR volumes), Premium (KDB + quant_premium pool)
+- DR volumes: `volumeType: DataProtection`, `replicationSchedule: Hourly`
+- Protocols: NFSv4.1 + CIFS (dual-protocol) unless Unix-only (KDB = NFSv4.1 only)
+- Security style: NTFS for dual-protocol, Unix for NFS-only
+- LDAP enabled: true for all volumes
+- Tags: `APP0000426`, `Investment Data Solutions`, `PRD`
+
+## Failover Workflow Summary
+```
+Phase 1 - Failover:
+  1. Manage-DFSPath Disable -Environment Production  → disables EU2 DFS target → writes dr_state.json
+  2. Manage-ANFReplication BreakReplication          → breaks ANF replication (CUS volume = read/write)
+  3. Manage-DFSPath Enable -Environment Production   → reads dr_state.json → enables CUS DFS target
+  Result: EU2 DFS=Offline, CUS DFS=Online, MirrorState=Broken ✓
+
+Phase 2 - Failback:
+  1. Manage-DFSPath Disable -Environment Production  → disables CUS DFS target → updates dr_state.json
+  2. Manage-ANFReplication ResyncReplication -Force  → resyncs (DISCARDS data on DR volume!) → polls Mirrored
+  3. Manage-DFSPath Enable -Environment Production   → reads dr_state.json → enables EU2 DFS target
+  Result: EU2 DFS=Online, CUS DFS=Offline, MirrorState=Mirrored ✓
+```
